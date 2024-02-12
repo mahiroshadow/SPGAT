@@ -19,7 +19,7 @@ class marginLoss(nn.Module):
         super(marginLoss, self).__init__()
 
     def forward(self, pos, neg, margin):
-        zero_tensor = floatTensor(pos.size())
+        zero_tensor = floatTensor(pos.size()).cuda()
         zero_tensor.zero_()
         zero_tensor = autograd.Variable(zero_tensor)
         return torch.sum(torch.max(pos - neg + margin, zero_tensor))

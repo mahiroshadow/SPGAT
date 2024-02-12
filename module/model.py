@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import loss
+import module.loss as loss
 import torch.autograd as autograd
 
 class Aggregator(nn.Module):
@@ -14,8 +14,7 @@ class Aggregator(nn.Module):
         self.linear4=nn.Linear(dim*2,dim)
         self.activation=F.leaky_relu
         self.activation1=F.tanh
-    def aggregator_user_item_layers(self,user_emb,item_emb,A_in):
-        all_emb=torch.cat([user_emb,item_emb],dim=0)
+    def aggregator_user_item_layers(self,all_emb,A_in):
         side_emb= torch.matmul(A_in, all_emb)
         return side_emb
 
@@ -41,10 +40,16 @@ class Aggregator(nn.Module):
 
 class SPGAT(nn.Module):
 
-    def __init__(self,n_users,n_items,n_relations,n_entities,dim,A,drop_rate,n_layers,M_ui,M_social,margin,L1_flag,A_in=None):
+    def __init__(self,n_users,n_items,n_relations,n_entities,dim,A,drop_rate,n_layers,margin,L1_flag,M_social,A_in=None):
         super(SPGAT,self).__init__()
-        self.entities_user_emb=nn.Parameter(nn.Embedding(n_users+n_entities,dim).weight)
-        self.rel_emb=nn.Parameter(nn.Embedding(n_relations,dim).weight)
+        self.entities_user_emb=nn.Embedding(n_users+n_entities,dim)
+        self.rel_emb=nn.Embedding(n_relations,dim)
+
+        self.entities_user_proj_emb = nn.Embedding(n_users+n_entities,dim)
+        self.rel_proj_emb = nn.Embedding(n_relations,dim)
+        self.entities_user_proj_emb.weight=nn.Parameter(torch.FloatTensor(n_users+n_entities,dim).zero_())
+        self.rel_proj_emb.weight=nn.Parameter(torch.FloatTensor(n_relations,dim).zero_())
+
         self.criterion_cf=F.logsigmoid
         self.drop_out=nn.Dropout(p=drop_rate)
         self.n_users=n_users
@@ -52,21 +57,19 @@ class SPGAT(nn.Module):
         self.n_entities=n_entities
         self.A=A
         self.aggregator=[Aggregator(drop_rate=drop_rate,dim=dim) for _ in range(n_layers)]
-        # 用户物品交互图
-        self.M_ui=M_ui
         # 用户社交网络
         self.M_social=M_social
         self.trans_M = nn.Parameter(torch.Tensor(n_relations,dim,dim))
         self.kg_loss_function= loss.marginLoss()
-        self.margin=autograd.Variable(torch.FloatTensor([margin]))
+        self.margin=autograd.Variable(torch.FloatTensor([margin]).cuda())
         self.L1_flag=L1_flag
-        self.A_in = nn.Parameter(
-            torch.sparse.FloatTensor(self.n_users + self.n_entities, self.n_users + self.n_entities))
+        self.A_in = nn.Parameter(torch.sparse.FloatTensor(self.n_users + self.n_entities, self.n_users + self.n_entities))
         if A_in is not None:
             self.A_in.data = A_in
         self.A_in.requires_grad = False
         self.linear1=nn.Linear(dim,dim,bias=False)
         self.linear2=nn.Linear(dim,dim,bias=False)
+        self.activation=F.leaky_relu
 
     def bi_interaction(self,emb_1,emb_2):
         sum_embeddings = self.activation(self.linear1(emb_1 - emb_2))
@@ -78,70 +81,62 @@ class SPGAT(nn.Module):
     def clac_cf_loss(self,users,pos_item,neg_item):
         # users/pos_item/neg_item dim= batch_size * dim
         users_emb_social_final=None
-        users_emb_cf_final=None
-        items_emb_cf_final=None
-        users_emb_s=users_emb_c=self.entities_user_emb[:self.n_users,]
-        items_emb_c=self.entities_user_emb[self.n_users:self.n_users+self.n_items,:]
+        all_emb_cf_final=None
+
+        users_emb_s=self.entities_user_emb.weight[self.n_entities:,]
+        all_emb=self.entities_user_emb.weight
 
         for layers in self.aggregator:
             users_emb_social=layers.aggregator_user_social_layers(users_emb_s,self.M_social)
-            all_emb=layers.aggregator_user_item_layers(users_emb_c,items_emb_c,self.A_in)
-
-            users_emb_cf=all_emb[:self.n_users,:]
-            items_emb_cf=all_emb[self.n_users:,:]
+            all_emb_temp=layers.aggregator_user_item_layers(all_emb,self.A_in)
 
             users_emb_social=self.bi_interaction(users_emb_s,users_emb_social)
-            users_emb_cf=self.bi_interaction(users_emb_c,users_emb_cf)
-            items_emb_cf=self.bi_interaction(items_emb_c,items_emb_cf)
-
-            users_emb_s=users_emb_social
-            users_emb_c=users_emb_cf
-            items_emb_c=items_emb_c
+            all_emb=self.bi_interaction(all_emb,all_emb_temp)
 
             if users_emb_social_final==None:
                 users_emb_social_final=users_emb_social
             else:
                 users_emb_social_final=torch.cat([users_emb_social_final,users_emb_social],dim=1)
-            if users_emb_cf_final==None and items_emb_cf_final==None:
-                items_emb_cf_final=items_emb_cf
-                users_emb_cf_final=users_emb_cf
+
+            if all_emb_cf_final==None:
+                all_emb_cf_final=all_emb
             else:
-                items_emb_cf_final = torch.cat([items_emb_cf_final, items_emb_cf_final], dim=1)
-                users_emb_cf_final = torch.cat([users_emb_cf_final, users_emb_cf_final], dim=1)
+                all_emb_cf_final=torch.cat([all_emb_cf_final,all_emb],dim=1)
 
-        pos_emb_cf = items_emb_cf_final[pos_item]
-        neg_emb_cf = items_emb_cf_final[neg_item]
+        pos_emb_cf = all_emb_cf_final[pos_item]
+        neg_emb_cf = all_emb_cf_final[neg_item]
 
 
-        u_emb_social=users_emb_social_final[users]
+        u_emb_social=users_emb_social_final[users-self.n_entities]
         user_pos=torch.sum(u_emb_social*pos_emb_cf,dim=1)
         user_neg=torch.sum(u_emb_social*neg_emb_cf,dim=1)
         cf_loss_social=-self.criterion_cf(user_pos-user_neg).mean()
-        u_emb_cf = users_emb_cf_final[users]
+
+        u_emb_cf = all_emb_cf_final[users]
         user_pos = torch.sum(u_emb_cf * pos_emb_cf, dim=1)
         user_neg = torch.sum(u_emb_cf * neg_emb_cf, dim=1)
         cf_loss_cf = -self.criterion_cf(user_pos - user_neg).mean()
         cf_loss=cf_loss_social+self.A*cf_loss_cf
         return cf_loss
 
-    def projection_transD_pytorch_samesize(entity_embedding, entity_projection, relation_projection):
+    def projection_transD_pytorch_samesize(self,entity_embedding, entity_projection, relation_projection):
         return entity_embedding + torch.sum(entity_embedding * entity_projection, dim=1,
                                             keepdim=True) * relation_projection
 
     def clac_kg_loss(self, pos_h, pos_t, pos_r, neg_h, neg_t, neg_r):
-        pos_h_e = self.ent_embeddings(pos_h)
-        pos_t_e = self.ent_embeddings(pos_t)
-        pos_r_e = self.rel_embeddings(pos_r)
-        pos_h_proj = self.ent_proj_embeddings(pos_h)
-        pos_t_proj = self.ent_proj_embeddings(pos_t)
-        pos_r_proj = self.rel_proj_embeddings(pos_r)
+        pos_h_e = self.entities_user_emb(pos_h)
+        pos_t_e = self.entities_user_emb(pos_t)
+        pos_r_e = self.rel_emb(pos_r)
+        pos_h_proj = self.entities_user_proj_emb(pos_h)
+        pos_t_proj = self.entities_user_proj_emb(pos_t)
+        pos_r_proj = self.rel_proj_emb(pos_r)
 
-        neg_h_e = self.ent_embeddings(neg_h)
-        neg_t_e = self.ent_embeddings(neg_t)
-        neg_r_e = self.rel_embeddings(neg_r)
-        neg_h_proj = self.ent_proj_embeddings(neg_h)
-        neg_t_proj = self.ent_proj_embeddings(neg_t)
-        neg_r_proj = self.rel_proj_embeddings(neg_r)
+        neg_h_e = self.entities_user_emb(neg_h)
+        neg_t_e = self.entities_user_emb(neg_t)
+        neg_r_e = self.rel_emb(neg_r)
+        neg_h_proj = self.entities_user_proj_emb(neg_h)
+        neg_t_proj = self.entities_user_proj_emb(neg_t)
+        neg_r_proj = self.rel_proj_emb(neg_r)
 
         pos_h_e = self.projection_transD_pytorch_samesize(pos_h_e, pos_h_proj, pos_r_proj)
         pos_t_e = self.projection_transD_pytorch_samesize(pos_t_e, pos_t_proj, pos_r_proj)
@@ -155,7 +150,7 @@ class SPGAT(nn.Module):
             pos = torch.sum((pos_h_e + pos_r_e - pos_t_e) ** 2, 1)
             neg = torch.sum((neg_h_e + neg_r_e - neg_t_e) ** 2, 1)
 
-        kg_loss = (self.kg_loss_function(pos, neg, self.margin)+loss.normLoss(self.entities_user_emb[torch.cat([pos_h, pos_t, neg_h, neg_t])]) +loss.normLoss(torch.cat([pos_r, neg_r]))
+        kg_loss = (self.kg_loss_function(pos, neg, self.margin)+loss.normLoss(self.entities_user_emb(torch.cat([pos_h, pos_t, neg_h, neg_t]))) +loss.normLoss(self.rel_emb(torch.cat([pos_r, neg_r])))
                    +loss.normLoss(pos_h_e) + loss.normLoss(pos_t_e) + loss.normLoss(neg_h_e) + loss.normLoss(neg_t_e))
         return kg_loss
 
@@ -196,6 +191,15 @@ class SPGAT(nn.Module):
         A_in = torch.sparse.FloatTensor(indices, values, torch.Size(shape))
         A_in = torch.sparse.softmax(A_in.cpu(), dim=1)
         self.A_in.data = A_in.to(device)
+
+    def calc_score(self, user_ids, item_ids):
+        all_embed = self.calc_cf_embeddings()  # (n_users + n_entities, concat_dim)
+        user_embed = all_embed[user_ids]  # (n_users, concat_dim)
+        item_embed = all_embed[item_ids]  # (n_items, concat_dim)
+
+        # Equation (12)
+        cf_score = torch.matmul(user_embed, item_embed.transpose(0, 1))  # (n_users, n_items)
+        return cf_score
 
 
 
